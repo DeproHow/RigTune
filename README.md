@@ -3,6 +3,12 @@
 RigTune scans your PC, gives it a score out of 100, and shows you what's actually costing you FPS.
 Most fixes take one click, and every change can be undone.
 
+![Storage](screenshots/storage.png)
+
+| Fresh Start | Dashboard |
+|---|---|
+| ![Fresh Start](screenshots/fresh-start.png) | ![Dashboard](screenshots/dashboard.png) |
+
 ## What's new in V2
 - 💾 **Storage tab**: see exactly what's taking your space and delete it safely
 - ✨ **Fresh Start tab**: repair and refresh Windows without resetting your PC
