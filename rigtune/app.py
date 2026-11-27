@@ -1,4 +1,5 @@
 """RigTune GUI (customtkinter)."""
+import os
 import queue
 import threading
 import time
@@ -6,8 +7,8 @@ import tkinter.messagebox as mb
 
 import customtkinter as ctk
 
-from . import (APP_NAME, APP_VERSION, boost, checks, cleanup, display, network, report, startup,
-               sysinfo, tweaks)
+from . import (APP_NAME, APP_VERSION, boost, checks, cleanup, display, freshstart, network, report, startup,
+               storage, sysinfo, tweaks)
 from .win import IS_WINDOWS, is_admin, open_url, relaunch_as_admin
 
 ACCENT = "#8b5cf6"
@@ -105,11 +106,12 @@ class App(ctk.CTk):
         sb = ctk.CTkFrame(self, width=230, fg_color=PANEL, corner_radius=0)
         sb.grid(row=0, column=0, sticky="nsw")
         sb.grid_propagate(False)
-        ctk.CTkLabel(sb, text="⚡ " + APP_NAME, font=font(24, True), text_color=ACCENT).pack(pady=(24, 2), padx=20, anchor="w")
+        ctk.CTkLabel(sb, text="⚡ " + APP_NAME + " V2", font=font(24, True), text_color=ACCENT).pack(pady=(24, 2), padx=20, anchor="w")
         ctk.CTkLabel(sb, text="Real optimizations. No placebo.", font=font(11), text_color=MUTED).pack(padx=20, anchor="w")
         self.nav_btns = {}
         items = [("dashboard", "🏠  Dashboard"), ("results", "🔍  Scan results"), ("optimize", "🛠  Optimize"),
                  ("boost", "🚀  Game Boost"), ("startup", "⏻  Startup apps"), ("cleanup", "🧹  Cleanup"),
+                 ("storage", "💾  Storage"), ("fresh", "✨  Fresh Start"),
                  ("network", "🌐  Network test"), ("system", "💻  System info"), ("tools", "🧰  Tools & history")]
         ctk.CTkFrame(sb, height=16, fg_color="transparent").pack()
         for key, label in items:
@@ -136,6 +138,7 @@ class App(ctk.CTk):
     def show(self, key):
         page_classes = {"dashboard": DashboardPage, "results": ResultsPage, "optimize": OptimizePage,
                         "boost": BoostPage, "startup": StartupPage, "cleanup": CleanupPage,
+                        "storage": StoragePage, "fresh": FreshStartPage,
                         "network": NetworkPage, "system": SystemPage, "tools": ToolsPage}
         if self.current:
             self.current.pack_forget()
@@ -976,6 +979,646 @@ class ToolsPage(Page):
             return
         res = tweaks.undo_all()
         self.app.toast(f"Undid {sum(1 for _, ok, _ in res if ok)} change(s)" if res else "Nothing to undo")
+
+# =========================================================================== dialogs
+def choose(app, title, text, options, danger=None):
+    """Small modal with custom buttons. Returns the chosen option or None."""
+    win = ctk.CTkToplevel(app)
+    win.title(title)
+    win.configure(fg_color=PANEL)
+    win.resizable(False, False)
+    win.transient(app)
+    res = {"v": None}
+    ctk.CTkLabel(win, text=text, font=font(13), justify="left", anchor="w", wraplength=520).pack(
+        fill="x", padx=22, pady=(20, 14))
+    row = ctk.CTkFrame(win, fg_color="transparent")
+    row.pack(fill="x", padx=18, pady=(0, 18))
+    for opt in options:
+        def pick(o=opt):
+            res["v"] = o
+            win.destroy()
+        b = button(row, opt, pick, primary=(opt == options[0]), width=170)
+        if opt == danger:
+            b.configure(fg_color="#7f1d1d", hover_color="#991b1b")
+        b.pack(side="left", padx=4)
+    button(row, "Cancel", win.destroy, primary=False, width=90).pack(side="right", padx=4)
+    win.update_idletasks()
+    x = app.winfo_rootx() + (app.winfo_width() - win.winfo_width()) // 2
+    y = app.winfo_rooty() + (app.winfo_height() - win.winfo_height()) // 3
+    win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    win.after(50, win.grab_set)
+    app.wait_window(win)
+    return res["v"]
+
+
+SAFETY_COLORS = {"green": "#22c55e", "yellow": "#f59e0b", "red": "#ef4444"}
+
+
+# =========================================================================== storage
+class StoragePage(Page):
+    MAX_ROWS = 120
+
+    def build(self):
+        header(self, "Storage", "Find what's eating your space. Green = safe, yellow = check first, "
+                                "red = part of Windows (RigTune won't let you delete it). "
+                                "Deleting goes to the Recycle Bin unless you pick 'Delete forever'.")
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", padx=24)
+        self.drive_menu = ctk.CTkOptionMenu(bar, values=["Loading drives..."], width=300,
+                                            fg_color="#2a2f3f", button_color="#353b4f")
+        self.drive_menu.pack(side="left")
+        self.scan_btn = button(bar, "🔍 Scan drive", self.scan)
+        self.scan_btn.pack(side="left", padx=8)
+        self.stop_btn = button(bar, "■ Stop", self.stop, primary=False, width=80)
+        self.status = ctk.CTkLabel(bar, text="", text_color=MUTED, font=font(12), anchor="w")
+        self.status.pack(side="left", padx=10, fill="x", expand=True)
+        self.prog = ctk.CTkProgressBar(self, progress_color=ACCENT, mode="indeterminate")
+        self.wins = ctk.CTkFrame(self, fg_color="transparent", height=1)
+        self.wins.pack(fill="x", padx=24, pady=(8, 0))
+        self.tabs = ctk.CTkTabview(self, fg_color=PANEL, segmented_button_selected_color=ACCENT,
+                                   segmented_button_selected_hover_color=ACCENT_HOVER,
+                                   command=self._tab_changed)
+        self.tabs.pack(fill="both", expand=True, padx=18, pady=(6, 14))
+        self.tab_names = ["📁 Folders", "📄 Biggest files", "📊 Categories", "🎮 Games", "🕸 Old files",
+                          "👯 Duplicates"]
+        self.frames = {}
+        for t in self.tab_names:
+            tab = self.tabs.add(t)
+            top = ctk.CTkFrame(tab, fg_color="transparent")
+            top.pack(fill="x")
+            body = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+            body.pack(fill="both", expand=True)
+            self.frames[t] = (top, body)
+        self.res = None
+        self.cur = None          # current folder Node
+        self.cancel = None
+        self.drives = []
+        self.games = None
+        self.dups = None
+        self._placeholder()
+
+    def on_show(self):
+        if not self.drives:
+            self.app.bg(storage.drives, self._got_drives)
+
+    def _got_drives(self, ds):
+        self.drives = ds
+        if not ds:
+            self.drive_menu.configure(values=["No drives found"])
+            self.drive_menu.set("No drives found")
+            return
+        vals = [f"{d['path']}   {storage.human(d['used'])} used of {storage.human(d['total'])}" for d in ds]
+        self.drive_menu.configure(values=vals)
+        self.drive_menu.set(vals[0])
+
+    def _placeholder(self):
+        for t in self.tab_names:
+            top, body = self.frames[t]
+            clear(top)
+            clear(body)
+            body._parent_canvas.yview_moveto(0)
+            ctk.CTkLabel(body, text="Pick a drive and click Scan.\nA full drive takes about 1-3 minutes.",
+                         text_color=MUTED, font=font(14)).pack(pady=60)
+
+    # ---------------------------------------------------------- scan
+    def _drive_path(self):
+        v = self.drive_menu.get()
+        for d in self.drives:
+            if v.startswith(d["path"]):
+                return d["path"]
+        return None
+
+    def scan(self):
+        path = self._drive_path()
+        if not path:
+            self.app.toast("Pick a drive first", "warn")
+            return
+        import threading
+        self.cancel = threading.Event()
+        self.scan_btn.configure(state="disabled")
+        self.stop_btn.pack(side="left", padx=(0, 8), after=self.scan_btn)
+        self.prog.pack(fill="x", padx=24, pady=(8, 0), after=self.scan_btn.master)
+        self.prog.start()
+        self.status.configure(text="Scanning...")
+        self.games = None
+        self.dups = None
+        cancel = self.cancel
+
+        def prog(files, dirs, cur):
+            short = cur if len(cur) < 70 else "..." + cur[-67:]
+            self.app.call(lambda: self.status.configure(text=f"{files:,} files, {dirs:,} folders  •  {short}"))
+
+        self.app.bg(lambda: storage.scan(path, prog, cancel), self._scan_done)
+
+    def stop(self):
+        if self.cancel:
+            self.cancel.set()
+
+    def _scan_done(self, res):
+        self.prog.stop()
+        self.prog.pack_forget()
+        self.stop_btn.pack_forget()
+        self.scan_btn.configure(state="normal")
+        self.res = res
+        self.cur = res.root
+        extra = " (stopped early - sizes are partial)" if res.cancelled else ""
+        denied = f", {res.denied:,} skipped (no access - run as admin to see more)" if res.denied else ""
+        self.status.configure(text=f"{storage.human(res.root.size)} in {res.file_count:,} files, "
+                                   f"scanned in {res.seconds:.0f}s{denied}{extra}")
+        self._render_wins()
+        self._render(self.tabs.get())
+
+    def _tab_changed(self):
+        if self.res:
+            self._render(self.tabs.get())
+
+    def _render(self, tab):
+        {"📁 Folders": self._folders, "📄 Biggest files": self._biggest, "📊 Categories": self._cats,
+         "🎮 Games": self._games, "🕸 Old files": self._old, "👯 Duplicates": self._dups}[tab]()
+
+    def _refresh(self):
+        self.status.configure(text=f"{storage.human(self.res.root.size)} in {self.res.root.files:,} files")
+        self._render(self.tabs.get())
+
+    # ---------------------------------------------------------- quick wins
+    def _render_wins(self):
+        clear(self.wins)
+        wins = storage.quick_wins(self.res)
+        if not wins:
+            return
+        ctk.CTkLabel(self.wins, text="⚡ Quick wins", font=font(15, True), anchor="w").pack(fill="x")
+        row = ctk.CTkFrame(self.wins, fg_color="transparent")
+        row.pack(fill="x")
+        for w in wins:
+            c = ctk.CTkFrame(row, fg_color=CARD, corner_radius=10, border_width=1, border_color=COLORS["good"])
+            c.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+            t = ctk.CTkFrame(c, fg_color="transparent")
+            t.pack(fill="x", padx=12, pady=(8, 0))
+            ctk.CTkLabel(t, text=w["title"], font=font(13, True), anchor="w").pack(side="left")
+            ctk.CTkLabel(t, text=storage.human(w["size"]), font=font(13, True),
+                         text_color=COLORS["good"]).pack(side="right")
+            ctk.CTkLabel(c, text=w["desc"], font=font(11), text_color=MUTED, wraplength=360, justify="left",
+                         anchor="w").pack(fill="x", padx=12)
+            button(c, w["label"], lambda w=w: self._do_win(w), width=150).pack(anchor="w", padx=12, pady=8)
+
+    def _do_win(self, w):
+        if w.get("admin") and not is_admin():
+            if mb.askyesno(APP_NAME, "This needs admin.\n\nRestart RigTune as admin now?"):
+                self.app._elevate()
+            return
+        if w["id"] == "recycle" and not mb.askyesno(APP_NAME, "Empty the Recycle Bin?\n\nThis is permanent."):
+            return
+        ok, msg = storage.run_quick_win(w["id"])
+        self.app.toast(msg, "good" if ok else "bad")
+        if ok and w["id"] in ("recycle", "hiber"):
+            if w["id"] == "hiber":
+                self.res.system_files.pop("hiberfil.sys", None)
+            self._render_wins()
+
+    # ---------------------------------------------------------- rows
+    def _row(self, body, name, path, size, total, is_dir=False, sub="", on_drill=None, color=None,
+             extra_btn=None):
+        level, why = storage.safety(path)
+        row = ctk.CTkFrame(body, fg_color=CARD, corner_radius=8)
+        row.pack(fill="x", padx=4, pady=2)
+        ctk.CTkLabel(row, text="●", text_color=SAFETY_COLORS[level], font=font(16), width=18).pack(
+            side="left", padx=(10, 2))
+        mid = ctk.CTkFrame(row, fg_color="transparent")
+        mid.pack(side="left", fill="x", expand=True, padx=6, pady=5)
+        label = ("📁 " if is_dir else "📄 ") + name
+        if on_drill:
+            lb = ctk.CTkButton(mid, text=label, anchor="w", font=font(13, True), fg_color="transparent",
+                               hover_color="#2a2f3f", text_color="#e5e7eb", height=24, command=on_drill)
+        else:
+            lb = ctk.CTkLabel(mid, text=label, anchor="w", font=font(13, True))
+        lb.pack(fill="x")
+        if sub:
+            ctk.CTkLabel(mid, text=sub, anchor="w", font=font(11), text_color=MUTED).pack(fill="x", padx=(4, 0))
+        frac = (size / total) if total else 0
+        pb = ctk.CTkProgressBar(row, width=160, progress_color=color or ACCENT)
+        pb.set(min(frac, 1))
+        pb.pack(side="left", padx=6)
+        ctk.CTkLabel(row, text=storage.human(size), font=font(13, True), width=80, anchor="e").pack(side="left")
+        ctk.CTkLabel(row, text=f"{frac * 100:.1f}%", font=font(11), text_color=MUTED, width=50).pack(side="left")
+        button(row, "📂", lambda: self._open(path, is_dir), primary=False, width=36).pack(side="left", padx=(6, 2))
+        if extra_btn:
+            button(row, extra_btn[0], extra_btn[1], primary=False, width=90).pack(side="left", padx=2)
+        if level != "red":
+            button(row, "🗑", lambda: self._delete(path, size, level, why), primary=False, width=36).pack(
+                side="left", padx=(2, 10))
+        else:
+            ctk.CTkLabel(row, text="🔒", width=36).pack(side="left", padx=(2, 10))
+        return row
+
+    def _open(self, path, is_dir):
+        if not IS_WINDOWS:
+            return
+        import subprocess
+        if is_dir:
+            subprocess.Popen(["explorer", path])
+        else:
+            subprocess.Popen(["explorer", "/select,", path])
+
+    def _delete(self, path, size, level, why):
+        name = os.path.basename(path.rstrip("\\/")) or path
+        warn = "\n\n⚠ " + why if level == "yellow" else ""
+        pick = choose(self.app, "Delete", f"Delete '{name}' ({storage.human(size)})?\n\n{path}{warn}",
+                      ["Recycle Bin", "Delete forever"], danger="Delete forever")
+        if not pick:
+            return
+        ok, msg = storage.delete(path, permanent=(pick == "Delete forever"))
+        self.app.toast(msg, "good" if ok else "bad")
+        if ok:
+            storage.forget(self.res, path, size)
+            if self.dups:
+                for g in self.dups:
+                    g["paths"] = [p for p in g["paths"] if p != path]
+                self.dups = [g for g in self.dups if len(g["paths"]) > 1]
+            if self.games:
+                self.games = [g for g in self.games if os.path.normcase(g["path"]) != os.path.normcase(path)]
+            self._refresh()
+
+    def _more(self, body, n):
+        if n > self.MAX_ROWS:
+            ctk.CTkLabel(body, text=f"+ {n - self.MAX_ROWS} smaller items not shown", text_color=MUTED,
+                         font=font(11)).pack(pady=6)
+
+    # ---------------------------------------------------------- tabs
+    def _folders(self):
+        top, body = self.frames["📁 Folders"]
+        clear(top)
+        clear(body)
+        body._parent_canvas.yview_moveto(0)
+        node = self.cur or self.res.root
+        if node.parent is not None:
+            button(top, "⬆ Up", lambda: self._go(node.parent), primary=False, width=70).pack(side="left", padx=4)
+        ctk.CTkLabel(top, text=f"{node.path}   •   {storage.human(node.size)}, {node.files:,} files",
+                     font=font(13, True), anchor="w").pack(side="left", padx=8, pady=4)
+        items = [(c.size, True, c) for c in node.children]
+        items += [(s, False, p) for s, p, _m in storage.folder_files(node.path)]
+        items.sort(key=lambda x: x[0], reverse=True)
+        total = node.size or 1
+        for size, is_dir, obj in items[:self.MAX_ROWS]:
+            if is_dir:
+                self._row(body, obj.name, obj.path, size, total, True,
+                          sub=f"{obj.files:,} files  •  {storage.CATEGORIES[obj.cat][0]}",
+                          on_drill=lambda c=obj: self._go(c), color=storage.CATEGORIES[obj.cat][1])
+            else:
+                self._row(body, os.path.basename(obj), obj, size, total)
+        if not items:
+            ctk.CTkLabel(body, text="Empty folder.", text_color=MUTED).pack(pady=30)
+        self._more(body, len(items))
+
+    def _go(self, node):
+        self.cur = node
+        self._folders()
+
+    def _biggest(self):
+        top, body = self.frames["📄 Biggest files"]
+        clear(top)
+        clear(body)
+        body._parent_canvas.yview_moveto(0)
+        ctk.CTkLabel(top, text="The biggest single files on this drive.", text_color=MUTED,
+                     font=font(12)).pack(side="left", padx=6, pady=4)
+        total = self.res.root.size or 1
+        files = self.res.biggest(self.MAX_ROWS)
+        for size, path, mtime, used in files:
+            self._row(body, os.path.basename(path), path, size, total,
+                      sub=f"{os.path.dirname(path)}  •  last used {storage.ago(used)}")
+
+    def _cats(self):
+        top, body = self.frames["📊 Categories"]
+        clear(top)
+        clear(body)
+        body._parent_canvas.yview_moveto(0)
+        ctk.CTkLabel(top, text="Where your space goes, by type.", text_color=MUTED,
+                     font=font(12)).pack(side="left", padx=6, pady=4)
+        cats = sorted(self.res.cats.items(), key=lambda x: x[1], reverse=True)
+        total = sum(v for _k, v in cats) or 1
+        for k, v in cats:
+            if v <= 0:
+                continue
+            name, color = storage.CATEGORIES[k]
+            row = ctk.CTkFrame(body, fg_color=CARD, corner_radius=8)
+            row.pack(fill="x", padx=4, pady=3)
+            ctk.CTkLabel(row, text=name, font=font(14, True), width=240, anchor="w").pack(side="left", padx=14, pady=10)
+            pb = ctk.CTkProgressBar(row, progress_color=color, height=14)
+            pb.set(v / total)
+            pb.pack(side="left", fill="x", expand=True, padx=8)
+            ctk.CTkLabel(row, text=storage.human(v), font=font(14, True), width=90, anchor="e").pack(side="left")
+            ctk.CTkLabel(row, text=f"{v / total * 100:.1f}%", font=font(12), text_color=MUTED, width=60).pack(
+                side="left", padx=(0, 10))
+            if k == "junk":
+                button(row, "Clean", lambda: self.app.show("cleanup"), width=80).pack(side="left", padx=(0, 10))
+            elif k == "games":
+                button(row, "See games", lambda: self.tabs.set("🎮 Games") or self._games(), width=90,
+                       primary=False).pack(side="left", padx=(0, 10))
+
+    def _games(self):
+        top, body = self.frames["🎮 Games"]
+        clear(top)
+        clear(body)
+        body._parent_canvas.yview_moveto(0)
+        if self.games is None:
+            ctk.CTkLabel(body, text="Measuring your games...", text_color=MUTED).pack(pady=30)
+            res = self.res
+            self.app.bg(lambda: storage.games_with_sizes(res), self._got_games)
+            self.games = []
+            return
+        ctk.CTkLabel(top, text="Your installed games. 'Uninstall' goes through the launcher so it stays happy.",
+                     text_color=MUTED, font=font(12)).pack(side="left", padx=6, pady=4)
+        if not self.games:
+            ctk.CTkLabel(body, text="No games found.", text_color=MUTED).pack(pady=30)
+            return
+        total = sum(g["size"] for g in self.games) or 1
+        for g in self.games:
+            played = storage.ago(g.get("last_played")) if g.get("last_played") else "unknown"
+            sub = f"{g['store']}  •  drive {g.get('drive', '?')}:  •  last played {played}"
+            if g.get("last_played") and (time.time() - g["last_played"]) > 90 * 86400:
+                sub += "   💤 not played in 3+ months"
+            if g["store"] == "Steam" and g.get("appid"):
+                act = ("Uninstall", lambda a=g["appid"]: open_url(f"steam://uninstall/{a}"))
+            else:
+                act = ("Uninstall", lambda: open_url("ms-settings:appsfeatures"))
+            self._row(body, g["name"], g["path"], g["size"], total, True, sub=sub,
+                      color=storage.CATEGORIES["games"][1], extra_btn=act)
+
+    def _got_games(self, gs):
+        self.games = gs
+        if self.tabs.get() == "🎮 Games":
+            self._games()
+
+    def _old(self):
+        top, body = self.frames["🕸 Old files"]
+        clear(top)
+        clear(body)
+        body._parent_canvas.yview_moveto(0)
+        ctk.CTkLabel(top, text=f"Files over 100 MB you haven't touched in {storage.OLD_DAYS}+ days "
+                               "(games, apps and Windows are left out).", text_color=MUTED,
+                     font=font(12)).pack(side="left", padx=6, pady=4)
+        files = self.res.old_files
+        if not files:
+            ctk.CTkLabel(body, text="Nothing old and big found ✔", text_color=MUTED).pack(pady=30)
+        total = sum(f[0] for f in files) or 1
+        for size, path, used in files[:self.MAX_ROWS]:
+            self._row(body, os.path.basename(path), path, size, total,
+                      sub=f"{os.path.dirname(path)}  •  last used {storage.ago(used)}")
+        self._more(body, len(files))
+
+    def _dups(self):
+        top, body = self.frames["👯 Duplicates"]
+        clear(top)
+        clear(body)
+        body._parent_canvas.yview_moveto(0)
+        button(top, "🔍 Find duplicates", self._find_dups, width=170).pack(side="left", padx=4, pady=4)
+        self.dup_lbl = ctk.CTkLabel(top, text="Compares file contents (not just names). Files over 5 MB.",
+                                    text_color=MUTED, font=font(12))
+        self.dup_lbl.pack(side="left", padx=8)
+        if self.dups is None:
+            return
+        if not self.dups:
+            ctk.CTkLabel(body, text="No duplicates found ✔", text_color=MUTED).pack(pady=30)
+            return
+        wasted = sum(g["wasted"] for g in self.dups)
+        self.dup_lbl.configure(text=f"{len(self.dups)} groups  •  {storage.human(wasted)} wasted. "
+                                    "Keep one copy of each, delete the rest.")
+        shown = 0
+        for g in self.dups:
+            if shown > self.MAX_ROWS:
+                break
+            ctk.CTkLabel(body, text=f"{len(g['paths'])} copies × {storage.human(g['size'])}  →  "
+                                    f"{storage.human(g['wasted'])} wasted", font=font(13, True),
+                         anchor="w").pack(fill="x", padx=8, pady=(10, 2))
+            for p in g["paths"]:
+                self._row(body, os.path.basename(p), p, g["size"], g["size"] * len(g["paths"]),
+                          sub=os.path.dirname(p))
+                shown += 1
+
+    def _find_dups(self):
+        import threading
+        self.cancel = threading.Event()
+        cancel = self.cancel
+        res = self.res
+        self.dup_lbl.configure(text="Comparing files...")
+
+        def prog(i, n):
+            self.app.call(lambda: self.dup_lbl.configure(text=f"Comparing files... {i}/{n}"))
+
+        def done(groups):
+            self.dups = groups
+            self._dups()
+        self.app.bg(lambda: storage.find_duplicates(res, prog, cancel), done)
+
+
+# =========================================================================== fresh start
+class FreshStartPage(Page):
+    def build(self):
+        header(self, "Fresh Start", "Like resetting your PC, but your games, files and apps stay. Repairs "
+                                    "Windows with its own tools, resets the stuff that usually breaks, turns back "
+                                    "on services that 'optimizer' tools disabled, and removes bloatware. "
+                                    "A restore point is made first so you can roll back.")
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", padx=24)
+        self.run_btn = button(bar, "✨ Run Fresh Start", self.start, width=200, height=40)
+        self.run_btn.pack(side="left")
+        button(bar, "⟳ Refresh lists", self.refresh, primary=False, width=140).pack(side="left", padx=8)
+        self.lbl = ctk.CTkLabel(bar, text="", text_color=MUTED, font=font(12))
+        self.lbl.pack(side="left", padx=10)
+        self.prog = ctk.CTkProgressBar(self, progress_color=ACCENT)
+        self.prog.set(0)
+        self.prog.pack(fill="x", padx=24, pady=(10, 0))
+        self.list = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.list.pack(fill="both", expand=True, padx=18, pady=(8, 4))
+        self.log_box = ctk.CTkTextbox(self, height=130, fg_color=PANEL, font=ctk.CTkFont(family="Consolas", size=12))
+        self.log_box.pack(fill="x", padx=24, pady=(0, 14))
+        self.log_box.configure(state="disabled")
+        self.step_vars = {}
+        self.svc_vars = []
+        self.bloat_vars = []
+        self.services = None
+        self.bloat = None
+        self.running = False
+        self._render()
+
+    def on_show(self):
+        if self.services is None:
+            self.refresh()
+
+    def refresh(self):
+        self.lbl.configure(text="Checking services and installed apps...")
+
+        def work():
+            return freshstart.disabled_services(), freshstart.installed_bloat()
+
+        def done(r):
+            self.services, self.bloat = r
+            self.lbl.configure(text="")
+            self._render()
+        self.app.bg(work, done)
+
+    def _section(self, title, sub):
+        ctk.CTkLabel(self.list, text=title, font=font(17, True), anchor="w").pack(fill="x", padx=8, pady=(14, 0))
+        ctk.CTkLabel(self.list, text=sub, font=font(12), text_color=MUTED, anchor="w", justify="left",
+                     wraplength=900).pack(fill="x", padx=8, pady=(0, 4))
+
+    def _check_row(self, text, desc, var, tags=()):
+        row = ctk.CTkFrame(self.list, fg_color=CARD, corner_radius=8)
+        row.pack(fill="x", padx=6, pady=2)
+        top = ctk.CTkFrame(row, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(8, 0))
+        ctk.CTkCheckBox(top, text=text, variable=var, font=font(13, True), fg_color=ACCENT).pack(side="left")
+        for t, col in tags:
+            ctk.CTkLabel(top, text=f" {t} ", fg_color=col, text_color="#000", corner_radius=6,
+                         font=font(10, True)).pack(side="left", padx=3)
+        ctk.CTkLabel(row, text=desc, font=font(11), text_color=MUTED, anchor="w", justify="left",
+                     wraplength=880).pack(fill="x", padx=40, pady=(0, 8))
+
+    def _render(self):
+        clear(self.list)
+        old = {k: v.get() for k, v in self.step_vars.items()}
+        self.step_vars = {}
+        self._section("🔧 Repair & reset", "The core of Fresh Start. Defaults are safe for everyone.")
+        for sid, name, desc, _f, admin, mins, reboot, default in freshstart.STEPS:
+            v = ctk.BooleanVar(value=old.get(sid, default))
+            self.step_vars[sid] = v
+            tags = [(mins, "#374151")]
+            if admin:
+                tags.append(("Admin", "#f59e0b"))
+            if reboot:
+                tags.append(("Restart needed", "#3b82f6"))
+            self._check_row(name, desc, v, tags)
+
+        self._section("⚙ Services that are turned off",
+                      "Windows services that were disabled (usually by an 'optimizer' or debloat script) and "
+                      "that break things when they're off. Ticked ones go back to the Windows default.")
+        self.svc_vars = []
+        if self.services is None:
+            ctk.CTkLabel(self.list, text="Checking...", text_color=MUTED).pack(anchor="w", padx=14)
+        elif not self.services:
+            ctk.CTkLabel(self.list, text="✔ None - all the important ones are on.", text_color=COLORS["good"],
+                         font=font(12, True)).pack(anchor="w", padx=14)
+        for s in self.services or []:
+            v = ctk.BooleanVar(value=s["default"])
+            self.svc_vars.append((s, v))
+            self._check_row(f"{s['friendly']}  →  {freshstart.SC_NAMES[s['start']]}", s["why"], v,
+                            [("Disabled", COLORS["bad"])])
+
+        self._section("🗑 Bloatware", "Apps Windows installed that most people never use. Removing them is "
+                                     "safe - you can reinstall any of them from the Microsoft Store.")
+        self.bloat_vars = []
+        if self.bloat is None:
+            ctk.CTkLabel(self.list, text="Checking...", text_color=MUTED).pack(anchor="w", padx=14)
+        elif not self.bloat:
+            ctk.CTkLabel(self.list, text="✔ No bloatware found.", text_color=COLORS["good"],
+                         font=font(12, True)).pack(anchor="w", padx=14)
+        for b in self.bloat or []:
+            v = ctk.BooleanVar(value=b["default"])
+            self.bloat_vars.append((b, v))
+            self._check_row(b["friendly"], b["note"] or b["name"], v)
+
+    # ---------------------------------------------------------- run
+    def log(self, text):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", text + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def start(self):
+        if self.running:
+            return
+        if not IS_WINDOWS:
+            self.app.toast("Fresh Start only works on Windows", "warn")
+            return
+        if not is_admin():
+            if mb.askyesno(APP_NAME, "Fresh Start needs admin to repair Windows.\n\nRestart RigTune as admin now?"):
+                self.app._elevate()
+            return
+        steps = [sid for sid, v in self.step_vars.items() if v.get()]
+        svcs = [s for s, v in self.svc_vars if v.get()]
+        apps = [b for b, v in self.bloat_vars if v.get()]
+        if not (steps or svcs or apps):
+            self.app.toast("Nothing ticked", "warn")
+            return
+        names = [freshstart.STEP_BY_ID[s][1] for s in steps]
+        if svcs:
+            names.append(f"Turn {len(svcs)} service(s) back on")
+        if apps:
+            names.append(f"Remove {len(apps)} bloatware app(s): " + ", ".join(b["friendly"] for b in apps[:6])
+                         + ("..." if len(apps) > 6 else ""))
+        if not mb.askyesno(APP_NAME, "Fresh Start will:\n\n• Create a restore point\n" +
+                           "\n".join("• " + n for n in names) +
+                           "\n\nThis can take 15-45 minutes. Close your games, keep the PC plugged in "
+                           "and don't turn it off. You can keep using it for light stuff.\n\nStart?"):
+            return
+        self.running = True
+        self.run_btn.configure(state="disabled", text="Running...")
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        self.log("🛟 Creating a restore point...")
+        self.prog.set(0)
+        self.app.bg(tweaks.create_restore_point, lambda r: self._after_rp(r, steps, svcs, apps))
+
+    def _after_rp(self, r, steps, svcs, apps):
+        ok, msg = r
+        self.log(("  ✔ " if ok else "  ⚠ ") + msg.splitlines()[0])
+        if not ok and "24h" not in msg:
+            if not mb.askyesno(APP_NAME, "Couldn't create a restore point:\n\n" + msg +
+                               "\n\nContinue without one? (Not recommended)"):
+                self._finish([], cancelled=True)
+                return
+        total = len(steps) + len(svcs) + len(apps)
+
+        def work():
+            results = []
+            n = 0
+
+            def tick(label, res):
+                nonlocal n
+                n += 1
+                results.append((label, *res))
+                self.app.call(self.log, ("  ✔ " if res[0] else "  ✖ ") + res[1])
+                self.app.call(self.prog.set, n / total)
+
+            for sid in steps:
+                s = freshstart.STEP_BY_ID[sid]
+                self.app.call(self.log, f"▶ {s[1]}  ({s[5]})")
+                self.app.call(lambda t=s[1]: self.lbl.configure(text=f"Now: {t}"))
+                tick(s[1], freshstart.run_step(sid))
+            if svcs:
+                self.app.call(self.log, "▶ Turning services back on")
+            for s in svcs:
+                tick(s["friendly"], freshstart.restore_service(s["name"]))
+            if apps:
+                self.app.call(self.log, "▶ Removing bloatware")
+            for b in apps:
+                tick(b["friendly"], freshstart.remove_app(b))
+            return results
+        self.app.bg(work, lambda res: self._finish(res, steps=steps))
+
+    def _finish(self, results, cancelled=False, steps=()):
+        self.running = False
+        self.run_btn.configure(state="normal", text="✨ Run Fresh Start")
+        self.lbl.configure(text="")
+        if cancelled:
+            self.log("Cancelled.")
+            return
+        good = sum(1 for r in results if r[1])
+        bad = [r for r in results if not r[1]]
+        self.log(f"Done: {good} worked, {len(bad)} failed.")
+        need_restart = any(freshstart.STEP_BY_ID[s][6] for s in steps) or "sfc" in steps or "dism" in steps
+        text = f"Fresh Start finished ✨\n\n{good} step(s) worked."
+        if bad:
+            text += "\n\nDidn't work:\n" + "\n".join(f"• {r[0]}: {r[2]}" for r in bad[:8])
+        if need_restart:
+            text += "\n\nRestart your PC to finish the repairs. Restart now?"
+            if mb.askyesno(APP_NAME, text):
+                freshstart.restart_pc()
+                self.app.toast("Restarting in 15 seconds - save your stuff", "warn")
+        else:
+            mb.showinfo(APP_NAME, text)
+        self.refresh()
+
 
 
 def main():

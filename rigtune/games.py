@@ -32,9 +32,13 @@ def steam_games():
                     txt = f.read()
                 name = re.search(r'"name"\s+"([^"]+)"', txt)
                 inst = re.search(r'"installdir"\s+"([^"]+)"', txt)
+                appid = re.search(r'"appid"\s+"(\d+)"', txt)
+                played = re.search(r'"LastPlayed"\s+"(\d+)"', txt)
                 if name:
                     path = os.path.join(lib, "steamapps", "common", inst.group(1) if inst else "")
-                    games.append({"name": name.group(1), "path": path, "store": "Steam"})
+                    games.append({"name": name.group(1), "path": path, "store": "Steam",
+                                  "appid": appid.group(1) if appid else None,
+                                  "last_played": int(played.group(1)) if played and played.group(1) != "0" else None})
             except OSError:
                 pass
     return [g for g in games if not g["name"].lower().startswith(("steamworks", "steam linux", "proton"))]

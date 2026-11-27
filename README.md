@@ -1,7 +1,11 @@
-# ⚡ RigTune: real PC gaming optimizer
+# ⚡ RigTune V2: real PC gaming optimizer
 
 RigTune scans your PC, gives it a score out of 100, and shows you what's actually costing you FPS.
 Most fixes take one click, and every change can be undone.
+
+## What's new in V2
+- 💾 **Storage tab**: see exactly what's taking your space and delete it safely
+- ✨ **Fresh Start tab**: repair and refresh Windows without resetting your PC
 
 ## How to run it
 1. Install **Python 3.11+** from https://www.python.org/downloads/ and tick **"Add python.exe to PATH"**.
@@ -32,6 +36,17 @@ It asks for admin automatically when it opens.
 **Startup apps**: turn startup apps on or off, the same way Task Manager does it.
 
 **Cleanup**: temp files, Windows Update cache, crash dumps, thumbnails, and shader caches (off by default).
+
+**Storage** (new in V2): TreeSize-style drive scan. Drill into folders, see the biggest files, a breakdown by
+type (games, Windows, apps, videos, junk...), every installed game with its size and when you last played it
+(uninstall through Steam directly), big files you haven't touched in 6+ months, and duplicate files (compared by
+content). Everything is colour-coded: green = safe, yellow = check first, red = Windows (RigTune refuses to delete it).
+Deleting goes to the Recycle Bin by default. Quick wins: empty Recycle Bin, turn off hibernation, remove Windows.old.
+
+**Fresh Start** (new in V2): "reset my PC" without losing anything. Makes a restore point, then repairs Windows
+(DISM + SFC), removes old update leftovers, resets Windows Update / the Store / the icon cache / DNS (full network
+reset and search rebuild optional), turns back on important services that were disabled (Windows Update, audio,
+Wi-Fi, Xbox services for Game Pass...), and removes bloatware you tick (Candy Crush, News, Clipchamp...).
 
 **Network test**: ping, jitter and packet loss to Cloudflare, Google, or any host you enter.
 
